@@ -70,6 +70,13 @@ typedef struct TpSegmentWriter
 	uint32			  posting_buffer_size; /* Current size of buffer */
 } TpSegmentWriter;
 
+typedef struct TpPageIndexWriteResult
+{
+	BlockNumber	 root;
+	BlockNumber *pages;
+	uint32		 num_pages;
+} TpPageIndexWriteResult;
+
 /* Forward declarations for index.c */
 struct TpLocalIndexState;
 
@@ -132,8 +139,12 @@ extern void tp_dump_segment_to_output(
 		Relation index, BlockNumber segment_root, struct DumpOutput *out);
 
 /* Page index writing (used by segment_merge.c) */
-extern BlockNumber
+extern TpPageIndexWriteResult
 write_page_index(Relation index, BlockNumber *pages, uint32 num_pages);
+
+/* WAL-log fully materialized segment/page-index pages for crash recovery. */
+extern void
+tp_wal_log_full_pages(Relation index, BlockNumber *pages, uint32 num_pages);
 
 /* Page reclamation for segment compaction */
 extern uint32 tp_segment_collect_pages(

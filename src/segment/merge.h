@@ -22,9 +22,10 @@ struct TpMergedTerm;
  */
 typedef struct TpMergeSink
 {
-	uint64			current_offset;
-	TpSegmentWriter writer;
-	Relation		index;
+	uint64				   current_offset;
+	TpSegmentWriter		   writer;
+	Relation			   index;
+	TpPageIndexWriteResult page_index;
 } TpMergeSink;
 
 /* Sink initialization */

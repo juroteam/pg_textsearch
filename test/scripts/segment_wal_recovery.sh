@@ -89,17 +89,10 @@ run_sql_value() {
 }
 
 simulate_crash() {
-    log "Simulating crash (SIGKILL)..."
-    local pid
-    pid=$(head -1 "${DATA_DIR}/postmaster.pid")
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        kill -9 "$pid"
-        sleep 2
-        rm -f "${DATA_DIR}/postmaster.pid"
-        log "Server killed (PID $pid)"
-    else
-        error "Could not find postmaster to kill"
-    fi
+    log "Simulating crash (immediate shutdown)..."
+    "${PGBINDIR}/pg_ctl" stop -D "${DATA_DIR}" -m immediate -w \
+        || error "Could not stop server in immediate mode"
+    log "Server stopped without clean shutdown"
 }
 
 restart_server() {
@@ -188,7 +181,8 @@ run_sql_quiet "SELECT bm25_spill_index('idx_wal_check');"
 lsn_after=""
 lsn_after=$(run_sql_value "SELECT pg_current_wal_insert_lsn();")
 wal_bytes=""
-wal_bytes=$(run_sql_value "SELECT wal_bytes FROM pg_stat_wal;")
+wal_bytes=$(run_sql_value \
+    "SELECT pg_wal_lsn_diff('${lsn_after}', '${lsn_before}')::bigint;")
 
 # How many segment pages were written?
 seg_pages=""
@@ -199,6 +193,10 @@ seg_pages=$(run_sql_value \
 
 info "Spill: $seg_pages segment pages, WAL: $wal_bytes bytes"
 info "LSN: $lsn_before -> $lsn_after"
+
+if [ "${seg_pages:-0}" -le 0 ]; then
+    fail "Part 1: could not parse spilled segment pages"
+fi
 
 # Each page is 8192 bytes.  If WAL-logged, we expect at least
 # seg_pages * 4096 bytes (conservative — deltas are smaller than
@@ -298,6 +296,62 @@ elif [ "$batch2_ct" -eq 3000 ]; then
     pass "Part 2b: post-recovery spill+compact works ($batch2_ct rows)"
 else
     fail "Part 2b: batch2 count=$batch2_ct (expected 3000)"
+fi
+
+# -------------------------------------------------------
+# Part 3: Crash recovery after CREATE INDEX
+#
+# Reproduces the production failure mode: standby/primary
+# recovery after a BM25 index build must replay both segment
+# pages and page-index pages from WAL.
+# -------------------------------------------------------
+
+log "Part 3: Crash recovery after CREATE INDEX"
+
+run_sql_quiet "CREATE TABLE build_recovery_test (
+    id serial PRIMARY KEY, content text);"
+run_sql_quiet "INSERT INTO build_recovery_test (content)
+    SELECT 'buildcrash_' || i || ' topic_' || (i % 80)
+           || ' ' || repeat('pad_', 20)
+    FROM generate_series(1, 8000) i;"
+
+run_sql_quiet "CHECKPOINT;"
+run_sql_quiet "SET max_parallel_maintenance_workers = 0;
+    CREATE INDEX idx_build_recovery ON build_recovery_test
+    USING bm25(content) WITH (text_config='english');"
+
+build_pre_ct=""
+build_pre_ct=$(run_sql_value \
+    "SELECT count(*) FROM build_recovery_test
+         WHERE content <@> to_bm25query('buildcrash', 'idx_build_recovery') < 0;")
+log "Pre-crash build query: $build_pre_ct rows"
+
+simulate_crash
+restart_server
+
+build_post_ct=""
+build_post_ct=$(run_sql_value \
+    "SELECT count(*) FROM build_recovery_test
+         WHERE content <@> to_bm25query('buildcrash', 'idx_build_recovery') < 0;" \
+    || echo "QUERY_FAILED")
+
+build_summary=""
+build_summary=$(run_sql_value \
+    "SELECT bm25_summarize_index('idx_build_recovery');" \
+    || echo "SUMMARY_FAILED")
+
+if [ "$build_post_ct" = "QUERY_FAILED" ]; then
+    fail "Part 3a: CREATE INDEX result is not queryable after recovery"
+elif [ "$build_post_ct" -eq "$build_pre_ct" ]; then
+    pass "Part 3a: CREATE INDEX result returns $build_post_ct rows after recovery"
+else
+    fail "Part 3a: post-crash $build_post_ct != pre-crash $build_pre_ct"
+fi
+
+if [ "$build_summary" = "SUMMARY_FAILED" ]; then
+    fail "Part 3b: CREATE INDEX result summary failed after recovery"
+else
+    pass "Part 3b: CREATE INDEX result summary works after recovery"
 fi
 
 # -------------------------------------------------------

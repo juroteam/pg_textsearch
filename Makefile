@@ -121,6 +121,7 @@ test-recovery:
 	@cd test/scripts && ./recovery.sh
 	@cd test/scripts && ./docid_chain_recovery.sh
 	@cd test/scripts && ./shutdown_spill.sh
+	@cd test/scripts && ./segment_wal_recovery.sh
 
 test-segment:
 	@echo "Running multi-backend segment tests..."

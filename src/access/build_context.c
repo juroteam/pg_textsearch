@@ -256,13 +256,13 @@ tp_build_context_get_sorted_terms(TpBuildContext *ctx, uint32 *num_terms)
 BlockNumber
 tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 {
-	TpBuildTermInfo *terms;
-	uint32			 num_terms;
-	BlockNumber		 header_block;
-	BlockNumber		 page_index_root;
-	TpSegmentWriter	 writer;
-	TpSegmentHeader	 header;
-	TpDictionary	 dict;
+	TpBuildTermInfo		  *terms;
+	uint32				   num_terms;
+	BlockNumber			   header_block;
+	TpPageIndexWriteResult page_index;
+	TpSegmentWriter		   writer;
+	TpSegmentHeader		   header;
+	TpDictionary		   dict;
 
 	uint32 *string_offsets;
 	uint32	string_pos;
@@ -538,11 +538,10 @@ tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 	writer.buffer_pos = SizeOfPageHeaderData;
 
 	/* Write page index */
-	page_index_root =
-			write_page_index(index, writer.pages, writer.pages_allocated);
+	page_index = write_page_index(index, writer.pages, writer.pages_allocated);
 
 	/* Finalize header */
-	header.page_index = page_index_root;
+	header.page_index = page_index.root;
 	header.data_size  = writer.current_offset;
 	header.num_pages  = writer.pages_allocated;
 
@@ -649,9 +648,6 @@ tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 
 	tp_segment_writer_finish(&writer);
 
-	/* Flush all pages to disk */
-	FlushRelationBuffers(index);
-
 	/* Write final header */
 	header_buf = ReadBuffer(index, header_block);
 	LockBuffer(header_buf, BUFFER_LOCK_EXCLUSIVE);
@@ -675,6 +671,9 @@ tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 	MarkBufferDirty(header_buf);
 	UnlockReleaseBuffer(header_buf);
 
+	tp_wal_log_full_pages(index, writer.pages, writer.pages_allocated);
+	tp_wal_log_full_pages(index, page_index.pages, page_index.num_pages);
+
 	FlushRelationBuffers(index);
 
 	/* Cleanup */
@@ -684,6 +683,8 @@ tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 	pfree(terms);
 	if (writer.pages)
 		pfree(writer.pages);
+	if (page_index.pages)
+		pfree(page_index.pages);
 
 	return header_block;
 }

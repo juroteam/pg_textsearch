@@ -51,7 +51,8 @@ merge_sink_init_pages(TpMergeSink *sink, Relation index)
 	memset(sink, 0, sizeof(TpMergeSink));
 	sink->index = index;
 	tp_segment_writer_init(&sink->writer, index);
-	sink->current_offset = sink->writer.current_offset;
+	sink->current_offset  = sink->writer.current_offset;
+	sink->page_index.root = InvalidBlockNumber;
 }
 
 /*
@@ -1340,14 +1341,12 @@ write_merged_segment_to_sink(
 
 	/* Flush writer and write page index */
 	{
-		BlockNumber page_index_root;
-
 		tp_segment_writer_flush(&sink->writer);
 		sink->writer.buffer_pos = SizeOfPageHeaderData;
 
-		page_index_root = write_page_index(
+		sink->page_index = write_page_index(
 				sink->index, sink->writer.pages, sink->writer.pages_allocated);
-		header.page_index = page_index_root;
+		header.page_index = sink->page_index.root;
 		header.num_pages  = sink->writer.pages_allocated;
 	}
 
@@ -1651,39 +1650,24 @@ tp_merge_level_segments(Relation index, uint32 level, uint32 max_merge)
 				total_tokens,
 				false);
 
-		/* WAL-log all merged segment pages */
+		if (sink.page_index.root == InvalidBlockNumber)
 		{
-			uint32 pg_idx = 0;
-
-			while (pg_idx < sink.writer.pages_allocated)
-			{
-				GenericXLogState *xstate;
-				Buffer			  xbufs[MAX_GENERIC_XLOG_PAGES];
-				uint32			  xn = 0, xj;
-
-				xstate = GenericXLogStart(index);
-
-				for (xj = 0; xj < MAX_GENERIC_XLOG_PAGES &&
-							 pg_idx < sink.writer.pages_allocated;
-					 xj++, pg_idx++)
-				{
-					xbufs[xn] = ReadBuffer(index, sink.writer.pages[pg_idx]);
-					LockBuffer(xbufs[xn], BUFFER_LOCK_EXCLUSIVE);
-					GenericXLogRegisterBuffer(
-							xstate, xbufs[xn], GENERIC_XLOG_FULL_IMAGE);
-					xn++;
-				}
-
-				GenericXLogFinish(xstate);
-
-				for (xj = 0; xj < xn; xj++)
-					UnlockReleaseBuffer(xbufs[xj]);
-			}
+			tp_segment_writer_finish(&sink.writer);
+			new_segment = InvalidBlockNumber;
+		}
+		else
+		{
+			tp_wal_log_full_pages(
+					index, sink.writer.pages, sink.writer.pages_allocated);
+			tp_wal_log_full_pages(
+					index, sink.page_index.pages, sink.page_index.num_pages);
 		}
 
 		/* Free writer pages array */
 		if (sink.writer.pages)
 			pfree(sink.writer.pages);
+		if (sink.page_index.pages)
+			pfree(sink.page_index.pages);
 
 		/* Free merged terms data */
 		for (i = 0; i < (int)num_merged_terms; i++)

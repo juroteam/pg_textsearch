@@ -786,6 +786,14 @@ tp_build_parallel(
 					total_tokens,
 					true /* disjoint_sources */);
 
+			if (sink.page_index.root == InvalidBlockNumber)
+				elog(ERROR, "parallel build produced no merged segment");
+
+			tp_wal_log_full_pages(
+					index, sink.writer.pages, sink.writer.pages_allocated);
+			tp_wal_log_full_pages(
+					index, sink.page_index.pages, sink.page_index.num_pages);
+
 			/*
 			 * Flush dirty buffers before updating the metapage,
 			 * ensuring merged segment data is durable first.
@@ -828,6 +836,8 @@ tp_build_parallel(
 
 			if (sink.writer.pages)
 				pfree(sink.writer.pages);
+			if (sink.page_index.pages)
+				pfree(sink.page_index.pages);
 
 			MemoryContextDelete(merge_ctx);
 		}

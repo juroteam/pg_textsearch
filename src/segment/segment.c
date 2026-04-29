@@ -767,6 +767,36 @@ allocate_segment_page(Relation index)
 	return block;
 }
 
+void
+tp_wal_log_full_pages(Relation index, BlockNumber *pages, uint32 num_pages)
+{
+	uint32 pg_idx = 0;
+
+	while (pg_idx < num_pages)
+	{
+		GenericXLogState *state;
+		Buffer			  bufs[MAX_GENERIC_XLOG_PAGES];
+		uint32			  n = 0;
+		uint32			  j;
+
+		state = GenericXLogStart(index);
+
+		for (j = 0; j < MAX_GENERIC_XLOG_PAGES && pg_idx < num_pages;
+			 j++, pg_idx++)
+		{
+			bufs[n] = ReadBuffer(index, pages[pg_idx]);
+			LockBuffer(bufs[n], BUFFER_LOCK_EXCLUSIVE);
+			GenericXLogRegisterBuffer(state, bufs[n], GENERIC_XLOG_FULL_IMAGE);
+			n++;
+		}
+
+		GenericXLogFinish(state);
+
+		for (j = 0; j < n; j++)
+			UnlockReleaseBuffer(bufs[j]);
+	}
+}
+
 /*
  * Grow writer's page array if needed
  */
@@ -811,11 +841,20 @@ tp_segment_writer_allocate_page(TpSegmentWriter *writer)
  * Write page index (chain of BlockNumbers).
  * This function is also used by segment_merge.c for merged segments.
  */
-static BlockNumber
+static TpPageIndexWriteResult
 write_page_index_internal(Relation index, BlockNumber *pages, uint32 num_pages)
 {
-	BlockNumber index_root = InvalidBlockNumber;
-	BlockNumber prev_block = InvalidBlockNumber;
+	TpPageIndexWriteResult result;
+	BlockNumber			   index_root = InvalidBlockNumber;
+	BlockNumber			   prev_block = InvalidBlockNumber;
+	uint32				   entries_per_page;
+	uint32				   num_index_pages;
+	BlockNumber			  *index_pages;
+	uint32				   i;
+
+	result.root		 = InvalidBlockNumber;
+	result.pages	 = NULL;
+	result.num_pages = 0;
 
 	/*
 	 * Calculate how many index pages we need.
@@ -823,15 +862,13 @@ write_page_index_internal(Relation index, BlockNumber *pages, uint32 num_pages)
 	 * account for that when calculating available space. Using raw sizeof()
 	 * would give us 1 extra entry that overlaps the special area!
 	 */
-	uint32 entries_per_page = (BLCKSZ - SizeOfPageHeaderData -
-							   MAXALIGN(sizeof(TpPageIndexSpecial))) /
-							  sizeof(BlockNumber);
-	uint32 num_index_pages = (num_pages + entries_per_page - 1) /
-							 entries_per_page;
+	entries_per_page = (BLCKSZ - SizeOfPageHeaderData -
+						MAXALIGN(sizeof(TpPageIndexSpecial))) /
+					   sizeof(BlockNumber);
+	num_index_pages = (num_pages + entries_per_page - 1) / entries_per_page;
 
 	/* Allocate index pages incrementally */
-	BlockNumber *index_pages = palloc(num_index_pages * sizeof(BlockNumber));
-	uint32		 i;
+	index_pages = palloc(num_index_pages * sizeof(BlockNumber));
 
 	for (i = 0; i < num_index_pages; i++)
 		index_pages[i] = allocate_segment_page(index);
@@ -878,6 +915,7 @@ write_page_index_internal(Relation index, BlockNumber *pages, uint32 num_pages)
 		for (j = 0; j < entries_to_write; j++)
 			page_data[j] = pages[start_idx + j];
 
+		((PageHeader)page)->pd_lower = BLCKSZ;
 		MarkBufferDirty(buffer);
 		UnlockReleaseBuffer(buffer);
 
@@ -886,11 +924,13 @@ write_page_index_internal(Relation index, BlockNumber *pages, uint32 num_pages)
 			index_root = index_pages[i];
 	}
 
-	pfree(index_pages);
-	return index_root;
+	result.root		 = index_root;
+	result.pages	 = index_pages;
+	result.num_pages = num_index_pages;
+	return result;
 }
 
-BlockNumber
+TpPageIndexWriteResult
 write_page_index(Relation index, BlockNumber *pages, uint32 num_pages)
 {
 	return write_page_index_internal(index, pages, num_pages);
@@ -979,14 +1019,14 @@ typedef struct TermBlockInfo
 BlockNumber
 tp_write_segment(TpLocalIndexState *state, Relation index)
 {
-	TermInfo		*terms;
-	uint32			 num_terms;
-	BlockNumber		 header_block;
-	BlockNumber		 page_index_root;
-	TpSegmentWriter	 writer;
-	TpSegmentHeader	 header;
-	TpDictionary	 dict;
-	TpDocMapBuilder *docmap;
+	TermInfo			  *terms;
+	uint32				   num_terms;
+	BlockNumber			   header_block;
+	TpPageIndexWriteResult page_index;
+	TpSegmentWriter		   writer;
+	TpSegmentHeader		   header;
+	TpDictionary		   dict;
+	TpDocMapBuilder		  *docmap;
 
 	uint32			*string_offsets;
 	uint32			 string_pos;
@@ -1309,9 +1349,8 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	 */
 	writer.buffer_pos = SizeOfPageHeaderData;
 
-	page_index_root =
-			write_page_index(index, writer.pages, writer.pages_allocated);
-	header.page_index = page_index_root;
+	page_index = write_page_index(index, writer.pages, writer.pages_allocated);
+	header.page_index = page_index.root;
 
 	/* Update header with actual values */
 	header.data_size = writer.current_offset;
@@ -1432,9 +1471,6 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 
 	tp_segment_writer_finish(&writer);
 
-	/* Flush to disk */
-	FlushRelationBuffers(index);
-
 	/* Update header on disk */
 	header_buf = ReadBuffer(index, header_block);
 	LockBuffer(header_buf, BUFFER_LOCK_EXCLUSIVE);
@@ -1469,35 +1505,8 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	 * buffer pages above.  This pass generates WAL records so
 	 * the pages survive crash recovery.
 	 */
-	{
-		uint32 pg_idx = 0;
-
-		while (pg_idx < writer.pages_allocated)
-		{
-			GenericXLogState *state;
-			Buffer			  bufs[MAX_GENERIC_XLOG_PAGES];
-			uint32			  n = 0;
-			uint32			  j;
-
-			state = GenericXLogStart(index);
-
-			for (j = 0;
-				 j < MAX_GENERIC_XLOG_PAGES && pg_idx < writer.pages_allocated;
-				 j++, pg_idx++)
-			{
-				bufs[n] = ReadBuffer(index, writer.pages[pg_idx]);
-				LockBuffer(bufs[n], BUFFER_LOCK_EXCLUSIVE);
-				GenericXLogRegisterBuffer(
-						state, bufs[n], GENERIC_XLOG_FULL_IMAGE);
-				n++;
-			}
-
-			GenericXLogFinish(state);
-
-			for (j = 0; j < n; j++)
-				UnlockReleaseBuffer(bufs[j]);
-		}
-	}
+	tp_wal_log_full_pages(index, writer.pages, writer.pages_allocated);
+	tp_wal_log_full_pages(index, page_index.pages, page_index.num_pages);
 
 	FlushRelationBuffers(index);
 
@@ -1508,6 +1517,8 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	tp_docmap_destroy(docmap);
 	if (writer.pages)
 		pfree(writer.pages);
+	if (page_index.pages)
+		pfree(page_index.pages);
 
 	return header_block;
 }
