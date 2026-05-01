@@ -178,6 +178,12 @@ lsn_before=$(run_sql_value "SELECT pg_current_wal_insert_lsn();")
 
 run_sql_quiet "SELECT bm25_spill_index('idx_wal_check');"
 
+if run_sql_quiet "ANALYZE wal_check;"; then
+    pass "Part 1b: spilled page-index pages are valid PostgreSQL pages"
+else
+    fail "Part 1b: spilled page-index pages are invalid PostgreSQL pages"
+fi
+
 lsn_after=""
 lsn_after=$(run_sql_value "SELECT pg_current_wal_insert_lsn();")
 wal_bytes=""

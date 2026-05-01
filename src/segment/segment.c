@@ -915,7 +915,8 @@ write_page_index_internal(Relation index, BlockNumber *pages, uint32 num_pages)
 		for (j = 0; j < entries_to_write; j++)
 			page_data[j] = pages[start_idx + j];
 
-		((PageHeader)page)->pd_lower = BLCKSZ;
+		((PageHeader)page)->pd_lower =
+				SizeOfPageHeaderData + entries_to_write * sizeof(BlockNumber);
 		MarkBufferDirty(buffer);
 		UnlockReleaseBuffer(buffer);
 
